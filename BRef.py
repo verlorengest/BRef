@@ -308,6 +308,22 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
     _sm = Vector((0, 0))
     _sw = _sh = _ratio = 0.0
 
+    # Add a region check to handle UI interaction properly
+    def _is_in_region(self, ctx, x, y):
+        """Check if mouse coordinates are within the 3D view region"""
+        region = ctx.region
+        return (0 <= x <= region.width and 0 <= y <= region.height)
+
+    # Add UI region check to prevent handling events outside the 3D view
+    def _is_in_ui_region(self, ctx, x, y):
+        """Check if mouse is over a UI panel region"""
+        for region in ctx.area.regions:
+            if region.type in {'UI', 'TOOLS', 'HEADER'} and region.width > 1:
+                if (region.x <= x <= region.x + region.width and
+                        region.y <= y <= region.y + region.height):
+                    return True
+        return False
+
     @classmethod
     def poll(cls, ctx):
         return not cls._active and ctx.area.type == 'VIEW_3D' and ctx.scene.draggable_images
@@ -315,9 +331,28 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
     def modal(self, ctx, event):
         scn, col = ctx.scene, ctx.scene.draggable_images
         m = Vector((event.mouse_region_x, event.mouse_region_y))
+        mx, my = event.mouse_x, event.mouse_y
+        show_all = scn.bref_show_all_layers
+        active_layer = col[scn.drag_img_index].layer if col and 0 <= scn.drag_img_index < len(col) else 0
+
+        # FIX 3: Allow UI interaction by passing through events
+        # when mouse is outside the 3D view region or over UI panels
+        if not self._is_in_region(ctx, event.mouse_region_x, event.mouse_region_y) or self._is_in_ui_region(ctx, mx,
+                                                                                                            my):
+            if self._idx != -1 and event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+                # Still catch mouse release to end dragging even outside region
+                self._idx, self._resize = -1, False
+            return {'PASS_THROUGH'}
 
         if event.type == 'K':
-            self._k_hold = (event.value == 'PRESS'); return {'RUNNING_MODAL'}
+            self._k_hold = (event.value == 'PRESS')
+            # FIX 1: When K is pressed, use the currently selected image index directly
+            if event.value == 'PRESS' and 0 <= scn.drag_img_index < len(col):
+                it = col[scn.drag_img_index]
+                self._idx, self._resize = scn.drag_img_index, True
+                self._sm, self._sw, self._sh = m.copy(), it.width, it.height
+                self._ratio = it.width / it.height if it.height else 1
+            return {'RUNNING_MODAL'}
 
         if event.type == 'MOUSEMOVE' and self._idx != -1:
             it = col[self._idx]
@@ -325,16 +360,28 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
                 dx, dy = m.x - self._sm.x, m.y - self._sm.y
                 w, h = self._sw + dx, self._sh + dy
                 if it.maintain_aspect and self._ratio:
-                    if abs(dx) > abs(dy): h = w / self._ratio
-                    else: w = h * self._ratio
+                    if abs(dx) > abs(dy):
+                        h = w / self._ratio
+                    else:
+                        w = h * self._ratio
                 it.width, it.height = max(10, w), max(10, h)
                 it.size = max(it.width, it.height)
             else:
                 it.x, it.y = m.x - self._offset.x, m.y - self._offset.y
-            redraw(ctx); return {'RUNNING_MODAL'}
+            redraw(ctx);
+            return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            for i in sorted(range(len(col)), key=lambda j: col[j].layer, reverse=True):
+            # FIX 2: Only consider visible layers based on the show_all setting
+            visible_images = []
+            for i in range(len(col)):
+                if show_all or col[i].layer == active_layer:
+                    visible_images.append(i)
+
+            # Sort visible images by layer for proper z-order
+            visible_images.sort(key=lambda j: col[j].layer, reverse=True)
+
+            for i in visible_images:
                 it = col[i]
                 if _corner(m, it) or self._k_hold:
                     self._idx, self._resize = i, True
@@ -344,23 +391,19 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
                 if _inside(m, it):
                     self._idx, self._resize = i, False
                     self._offset = m - Vector((it.x, it.y))
-                    scn.drag_img_index = i; return {'RUNNING_MODAL'}
+                    scn.drag_img_index = i;
+                    return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-            self._idx, self._resize = -1, False; return {'RUNNING_MODAL'}
+            self._idx, self._resize = -1, False;
+            return {'RUNNING_MODAL'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
-            self.__class__._active = False; return {'CANCELLED'}
+            self.__class__._active = False;
+            return {'CANCELLED'}
 
         return {'PASS_THROUGH'}
-
-    def invoke(self, ctx, _):
-        self.__class__._active = True
-        self._idx = -1; self._resize = self._k_hold = False
-        ctx.window_manager.modal_handler_add(self)
-        self.report({'INFO'}, "Drag Mode — RMB/ESC exit • K resize")
-        return {'RUNNING_MODAL'}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
