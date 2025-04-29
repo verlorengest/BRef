@@ -140,8 +140,30 @@ def _inside(p, it):
 
 
 def _corner(p, it):
-    return (it.x + it.width  - 20 <= p.x <= it.x + it.width) and \
-           (it.y + it.height - 20 <= p.y <= it.y + it.height)
+    corner_size = 30  # Size of the corner clickable area
+
+    # Check all four corners
+    # Bottom-right corner
+    if (it.x + it.width - corner_size <= p.x <= it.x + it.width) and \
+            (it.y + it.height - corner_size <= p.y <= it.y + it.height):
+        return True
+
+    # Bottom-left corner
+    if (it.x <= p.x <= it.x + corner_size) and \
+            (it.y + it.height - corner_size <= p.y <= it.y + it.height):
+        return True
+
+    # Top-right corner
+    if (it.x + it.width - corner_size <= p.x <= it.x + it.width) and \
+            (it.y <= p.y <= it.y + corner_size):
+        return True
+
+    # Top-left corner
+    if (it.x <= p.x <= it.x + corner_size) and \
+            (it.y <= p.y <= it.y + corner_size):
+        return True
+
+    return False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Orthographic Operators
@@ -308,22 +330,6 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
     _sm = Vector((0, 0))
     _sw = _sh = _ratio = 0.0
 
-    # Add a region check to handle UI interaction properly
-    def _is_in_region(self, ctx, x, y):
-        """Check if mouse coordinates are within the 3D view region"""
-        region = ctx.region
-        return (0 <= x <= region.width and 0 <= y <= region.height)
-
-    # Add UI region check to prevent handling events outside the 3D view
-    def _is_in_ui_region(self, ctx, x, y):
-        """Check if mouse is over a UI panel region"""
-        for region in ctx.area.regions:
-            if region.type in {'UI', 'TOOLS', 'HEADER'} and region.width > 1:
-                if (region.x <= x <= region.x + region.width and
-                        region.y <= y <= region.y + region.height):
-                    return True
-        return False
-
     @classmethod
     def poll(cls, ctx):
         return not cls._active and ctx.area.type == 'VIEW_3D' and ctx.scene.draggable_images
@@ -331,27 +337,20 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
     def modal(self, ctx, event):
         scn, col = ctx.scene, ctx.scene.draggable_images
         m = Vector((event.mouse_region_x, event.mouse_region_y))
-        mx, my = event.mouse_x, event.mouse_y
         show_all = scn.bref_show_all_layers
         active_layer = col[scn.drag_img_index].layer if col and 0 <= scn.drag_img_index < len(col) else 0
 
-        # FIX 3: Allow UI interaction by passing through events
-        # when mouse is outside the 3D view region or over UI panels
-        if not self._is_in_region(ctx, event.mouse_region_x, event.mouse_region_y) or self._is_in_ui_region(ctx, mx,
-                                                                                                            my):
-            if self._idx != -1 and event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-                # Still catch mouse release to end dragging even outside region
-                self._idx, self._resize = -1, False
-            return {'PASS_THROUGH'}
+        # Allow interaction with UI
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            # Check if mouse is over UI region
+            for region in ctx.area.regions:
+                if region.type == 'UI':
+                    if (region.x <= event.mouse_x <= region.x + region.width and
+                            region.y <= event.mouse_y <= region.y + region.height):
+                        return {'PASS_THROUGH'}
 
         if event.type == 'K':
             self._k_hold = (event.value == 'PRESS')
-            # FIX 1: When K is pressed, use the currently selected image index directly
-            if event.value == 'PRESS' and 0 <= scn.drag_img_index < len(col):
-                it = col[scn.drag_img_index]
-                self._idx, self._resize = scn.drag_img_index, True
-                self._sm, self._sw, self._sh = m.copy(), it.width, it.height
-                self._ratio = it.width / it.height if it.height else 1
             return {'RUNNING_MODAL'}
 
         if event.type == 'MOUSEMOVE' and self._idx != -1:
@@ -368,21 +367,20 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
                 it.size = max(it.width, it.height)
             else:
                 it.x, it.y = m.x - self._offset.x, m.y - self._offset.y
-            redraw(ctx);
+            redraw(ctx)
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            # FIX 2: Only consider visible layers based on the show_all setting
-            visible_images = []
-            for i in range(len(col)):
-                if show_all or col[i].layer == active_layer:
-                    visible_images.append(i)
+            # Filter items based on visibility settings
+            visible_items = [
+                (i, it) for i, it in enumerate(col)
+                if show_all or it.layer == active_layer
+            ]
 
-            # Sort visible images by layer for proper z-order
-            visible_images.sort(key=lambda j: col[j].layer, reverse=True)
+            # Sort by layer so top layers get priority
+            visible_items.sort(key=lambda x: x[1].layer, reverse=True)
 
-            for i in visible_images:
-                it = col[i]
+            for i, it in visible_items:
                 if _corner(m, it) or self._k_hold:
                     self._idx, self._resize = i, True
                     self._sm, self._sw, self._sh = m.copy(), it.width, it.height
@@ -391,19 +389,28 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
                 if _inside(m, it):
                     self._idx, self._resize = i, False
                     self._offset = m - Vector((it.x, it.y))
-                    scn.drag_img_index = i;
+                    scn.drag_img_index = i
                     return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-            self._idx, self._resize = -1, False;
+            self._idx, self._resize = -1, False
             return {'RUNNING_MODAL'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
-            self.__class__._active = False;
+            self.__class__._active = False
             return {'CANCELLED'}
 
+        # Allow UI interaction for other events
         return {'PASS_THROUGH'}
+
+    def invoke(self, ctx, _):
+        self.__class__._active = True
+        self._idx = -1
+        self._resize = self._k_hold = False
+        ctx.window_manager.modal_handler_add(self)
+        self.report({'INFO'}, "Drag Mode — RMB/ESC exit • K resize • Drag corners to resize")
+        return {'RUNNING_MODAL'}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -458,7 +465,7 @@ class VIEW3D_PT_bref_panel(bpy.types.Panel):
             instr_box = lay.box()
             instr_row = instr_box.row(align=True)
             instr_row.label(text="RMB/ESC: Exit", icon='MOUSE_RMB')
-            instr_row.label(text="K: Resize",   icon='FULLSCREEN_ENTER')
+            instr_row.label(text="Resize: Hold K or Drag Top Right Corner",   icon='FULLSCREEN_ENTER')
         else:
             drag_box.operator("view3d.drag_images", text="Enter Drag Mode", icon='HAND')
 
@@ -527,6 +534,63 @@ class VIEW3D_PT_bref_panel(bpy.types.Panel):
 # Draw callback – viewport overlay images
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def draw_frame(x, y, w, h, color=(0.0, 1.0, 0.0, 0.8), thickness=2.0):
+    """Draw a rectangular frame with the given parameters"""
+    # Create vertices for the frame (as one continuous line)
+    verts = [
+        (x, y),  # Bottom-left
+        (x + w, y),  # Bottom-right
+        (x + w, y + h),  # Top-right
+        (x, y + h),  # Top-left
+        (x, y)  # Back to start
+    ]
+
+    # Create batch for line drawing
+    line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": verts})
+
+    # Set line width and draw
+    gpu.state.line_width_set(thickness)
+    line_shader.bind()
+    line_shader.uniform_float("color", color)
+    batch.draw(line_shader)
+    gpu.state.line_width_set(1.0)
+
+
+def draw_corner_handle(x, y, size=20.0, color=(0.0, 1.0, 0.0, 1.0)):
+    """Draw a visible corner resize handle"""
+    # Draw a filled square for better visibility
+    verts = [
+        (x - size, y - size),  # Bottom-left
+        (x, y - size),  # Bottom-right
+        (x, y),  # Top-right
+        (x - size, y)  # Top-left
+    ]
+
+    # Create batch for filled polygon
+    fill_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = batch_for_shader(fill_shader, 'TRI_FAN', {"pos": verts})
+
+    # Draw filled square
+    fill_shader.bind()
+    fill_shader.uniform_float("color", (color[0], color[1], color[2], 0.3))  # Semi-transparent
+    batch.draw(fill_shader)
+
+    # Draw outline
+    line_verts = verts + [verts[0]]  # Close the loop
+    line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    line_batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": line_verts})
+
+    gpu.state.line_width_set(3.0)
+    line_shader.bind()
+    line_shader.uniform_float("color", color)
+    line_batch.draw(line_shader)
+    gpu.state.line_width_set(1.0)
+
+
+# Then modify the draw_cb function to properly place the handles at each corner
+
 def draw_cb():
     ctx = bpy.context
     scn, imgs = ctx.scene, ctx.scene.draggable_images
@@ -562,13 +626,26 @@ def draw_cb():
         shader().uniform_sampler("image", tex)
         batch.draw(shader())
 
+        # Draw frame and handles when in drag mode
+        if VIEW3D_OT_drag_images._active:
+            # Draw green frame
+            draw_frame(x, y, w, h)
+
+            # Draw corner handles at each corner
+            draw_corner_handle(x + w, y + h)  # Bottom-right
+            draw_corner_handle(x, y + h)  # Bottom-left
+            draw_corner_handle(x + w, y)  # Top-right
+            draw_corner_handle(x, y)  # Top-left
+
     gpu.state.blend_set('NONE')
 
     if VIEW3D_OT_drag_images._active:
         reg = ctx.region
         blf.size(0, 14, 72)
         blf.color(0, 0.0, 1.0, 0.0, 1.0)
-        txt = "RMB / ESC to exit   •   K to resize"
+        txt = "RMB / ESC exit • K resize • Drag green corners to resize"
+        if not scn.bref_show_all_layers:
+            txt += f" • Only layer {active_layer} visible"
         w, _ = blf.dimensions(0, txt)
         blf.position(0, reg.width - w - 15, 20, 0)
         blf.draw(0, txt)
