@@ -38,7 +38,7 @@ Simple, fast, and built for Blender 4.4+.
 |------------------------|----------|
 | Enter/Exit Drag Mode   | Click "Enter Drag Mode" or use Right Mouse / ESC |
 | Move Image             | Left Click and Drag |
-| Resize Image           | Hold `K` key while dragging |
+| Resize Image           | Drag the Image from Right Top Corner or K |
 | Center Selected Image  | Button in Sidebar |
 
 ---
