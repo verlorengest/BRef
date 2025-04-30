@@ -56,6 +56,24 @@ class OrthoImageSettings(bpy.types.PropertyGroup):
 # Utility helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def safe_load_image(filepath):
+    """Safely load an image and create texture, with error handling"""
+    if not filepath or not os.path.exists(filepath):
+        return None, None
+
+    try:
+        img = bpy.data.images.load(filepath, check_existing=True)
+        tex = gpu.texture.from_image(img)
+        return img, tex
+    except Exception as e:
+        print(f"Failed to load image {filepath}: {e}")
+        return None, None
+
+def snap_to_grid(value, grid_size):
+    """Snap a value to the nearest grid point"""
+    return round(value / grid_size) * grid_size
+
+
 def shader():
     global _shader
     if _shader is None:
@@ -127,7 +145,19 @@ class OrthographicReferences(bpy.types.PropertyGroup):
     up:     bpy.props.PointerProperty(type=OrthoImageSettings)
     down:   bpy.props.PointerProperty(type=OrthoImageSettings)
 
-
+# Add this after the other property groups
+class GridSettings(bpy.types.PropertyGroup):
+    enabled: bpy.props.BoolProperty(name="Enable Grid Snapping", default=False)
+    size: bpy.props.FloatProperty(name="Grid Size", default=20.0, min=1.0, description="Size of grid cells")
+    color: bpy.props.FloatVectorProperty(
+        name="Grid Color",
+        subtype='COLOR',
+        default=(0.2, 0.6, 1.0, 0.3),
+        size=4,
+        min=0.0, max=1.0,
+        description="Color of grid lines"
+    )
+    show_grid: bpy.props.BoolProperty(name="Show Grid", default=True, description="Display grid lines")
 
 
 
@@ -254,26 +284,149 @@ class IMAGE_UL_draggable(bpy.types.UIList):
 
 class IMAGE_OT_add(bpy.types.Operator):
     bl_idname = "image.add_draggable"
-    bl_label  = "Add Reference Image"
-    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    bl_label = "Add Reference Image(s)"
+    files: bpy.props.CollectionProperty(type=bpy.types.OperatorFileListElement)
+    directory: bpy.props.StringProperty(subtype='DIR_PATH')
+    filter_image: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
 
     def execute(self, ctx):
-        col, it = ctx.scene.draggable_images, ctx.scene.draggable_images.add()
-        it.filepath, it.layer = self.filepath, len(col) - 1
-        try:
-            img = bpy.data.images.load(self.filepath, check_existing=True)
-            _tex_cache[self.filepath] = (img, gpu.texture.from_image(img))
-            it.width, it.height = img.size[0] / 2, img.size[1] / 2    # ½-size
-            it.size = max(it.width, it.height)
-        except Exception as e:
-            self.report({'ERROR'}, str(e)); col.remove(len(col) - 1)
-            return {'CANCELLED'}
-        ctx.scene.drag_img_index = len(col) - 1
-        redraw(ctx); return {'FINISHED'}
+        col = ctx.scene.draggable_images
+        added_count = 0
+
+        # Get all selected files
+        filepaths = [os.path.join(self.directory, f.name) for f in self.files]
+
+        # Save current index to set to first newly added image
+        first_new_index = len(col)
+
+        # Process each file
+        for filepath in filepaths:
+            if not os.path.isfile(filepath):
+                continue
+
+            try:
+                # Load image first to verify it works
+                img = bpy.data.images.load(filepath, check_existing=True)
+
+                # Only add to collection if image loaded successfully
+                it = col.add()
+                it.filepath = filepath
+                it.layer = len(col) - 1
+
+                # Create texture safely
+                _tex_cache[filepath] = (img, gpu.texture.from_image(img))
+                it.width, it.height = img.size[0] / 2, img.size[1] / 2  # ½-size
+                it.size = max(it.width, it.height)
+                added_count += 1
+            except Exception as e:
+                self.report({'ERROR'}, f"Error loading {os.path.basename(filepath)}: {str(e)}")
+                continue
+
+        # If images were added, arrange them
+        if added_count > 0:
+            ctx.scene.drag_img_index = first_new_index
+            # Use try/except to prevent crashes if smart arrange fails
+            try:
+                bpy.ops.image.smart_arrange()
+            except Exception as e:
+                self.report({'WARNING'}, f"Smart arrange failed: {str(e)}")
+
+        self.report({'INFO'}, f"Added {added_count} reference image(s)")
+        redraw(ctx)
+        return {'FINISHED'}
 
     def invoke(self, ctx, _):
         ctx.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
+
+class IMAGE_OT_smart_arrange(bpy.types.Operator):
+    bl_idname = "image.smart_arrange"
+    bl_label = "Smart Arrange"
+    bl_description = "Arrange reference images from top-left corner downward"
+
+    arrange_all: bpy.props.BoolProperty(
+        name="Arrange All",
+        description="Arrange all images or only newly added ones",
+        default=True
+    )
+
+    @classmethod
+    def poll(cls, ctx):
+        return bool(ctx.scene.draggable_images)
+
+    def execute(self, ctx):
+        col = ctx.scene.draggable_images
+        if not col:
+            return {'CANCELLED'}
+
+        # Get viewport dimensions
+        region = None
+        for a in ctx.screen.areas:
+            if a.type == 'VIEW_3D':
+                for r in a.regions:
+                    if r.type == 'WINDOW':
+                        region = r
+                        break
+                if region:
+                    break
+
+        if not region:
+            self.report({'WARNING'}, "No 3D viewport found")
+            return {'CANCELLED'}
+
+        viewport_width, viewport_height = region.width, region.height
+
+        MAX_SIZE = min(viewport_width, viewport_height) * 0.2
+        PADDING = 10  # Smaller padding between images
+        LEFT_MARGIN = 20  # Left margin
+        TOP_MARGIN = 20  # Top margin
+
+        # Get images to arrange
+        images_to_arrange = list(col)
+
+        # First pass: scale down all images
+        for img in images_to_arrange:
+            scale_factor = 1.0
+
+            # Always scale down images to fit better
+            w_scale = MAX_SIZE / img.width if img.width > MAX_SIZE / 2 else 1.0
+            h_scale = MAX_SIZE / img.height if img.height > MAX_SIZE / 2 else 1.0
+            scale_factor = min(w_scale, h_scale, 0.7)  # Force additional scaling
+
+            # Apply scaling
+            img.width *= scale_factor
+            img.height *= scale_factor
+            img.size = max(img.width, img.height)
+
+        # Arrange images in a vertical column layout
+        current_x = LEFT_MARGIN
+        current_y = viewport_height - TOP_MARGIN
+        row_height = 0
+        max_row_width = viewport_width * 0.8  # Use 80% of viewport width
+
+        for img in images_to_arrange:
+            # Check if we need to start a new row
+            if current_x + img.width > max_row_width:
+                current_x = LEFT_MARGIN
+                current_y -= (row_height + PADDING)
+                row_height = 0
+
+            # Position image
+            img.x = current_x
+            img.y = current_y - img.height
+
+            # Ensure image stays within viewport
+            img.x = max(LEFT_MARGIN, min(img.x, viewport_width - img.width - PADDING))
+            img.y = max(PADDING, min(img.y, viewport_height - img.height - PADDING))
+
+            # Update row height and move next position
+            row_height = max(row_height, img.height)
+            current_x += img.width + PADDING
+
+        self.report({'INFO'}, f"Arranged {len(images_to_arrange)} images from top-left")
+        redraw(ctx)
+        return {'FINISHED'}
 
 class IMAGE_OT_remove(bpy.types.Operator):
     bl_idname, bl_label = "image.remove_draggable", "Remove Image"
@@ -366,7 +519,16 @@ class VIEW3D_OT_drag_images(bpy.types.Operator):
                 it.width, it.height = max(10, w), max(10, h)
                 it.size = max(it.width, it.height)
             else:
-                it.x, it.y = m.x - self._offset.x, m.y - self._offset.y
+                new_x = m.x - self._offset.x
+                new_y = m.y - self._offset.y
+
+                # Apply grid snapping if enabled
+                if scn.grid_settings.enabled:
+                    grid_size = scn.grid_settings.size
+                    new_x = snap_to_grid(new_x, grid_size)
+                    new_y = snap_to_grid(new_y, grid_size)
+
+                it.x, it.y = new_x, new_y
             redraw(ctx)
             return {'RUNNING_MODAL'}
 
@@ -500,6 +662,25 @@ class VIEW3D_PT_bref_panel(bpy.types.Panel):
             box.separator()
             box.operator("image.reset_draggable_position", icon='PIVOT_ACTIVE', text="Center Image")
 
+
+        # Add Grid Settings
+        grid_box = lay.box()
+        grid_box.label(text="Grid Settings", icon='GRID')
+        grid_box.prop(ctx.scene.grid_settings, "enabled", text="Snap to Grid")
+
+        if ctx.scene.grid_settings.enabled:
+            grid_row = grid_box.row(align=True)
+            grid_row.prop(ctx.scene.grid_settings, "size", text="Grid Size")
+            grid_row.prop(ctx.scene.grid_settings, "show_grid", text="",
+                          icon='RESTRICT_VIEW_ON' if not ctx.scene.grid_settings.show_grid else 'RESTRICT_VIEW_OFF')
+            grid_box.prop(ctx.scene.grid_settings, "color", text="Grid Color")
+
+        # SMART ARRANGE
+        arrange_box = lay.box()
+        arrange_box.label(text="Image Layout", icon='ALIGN_MIDDLE')
+        arrange_box.operator("image.smart_arrange", text="Smart Arrange", icon='ALIGN_JUSTIFY')
+
+
         # ───── ORTHOGRAPHIC  ─────
         ortho = scn.ortho_refs
         ortho_box = lay.box()
@@ -529,6 +710,8 @@ class VIEW3D_PT_bref_panel(bpy.types.Panel):
             op_row = ortho_box.row(align=True)
             op_row.operator("bref.spawn_ortho_refs", icon='IMAGE_REFERENCE')
             op_row.operator("bref.clear_ortho_refs", icon='TRASH')
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Draw callback – viewport overlay images
@@ -591,9 +774,51 @@ def draw_corner_handle(x, y, size=20.0, color=(0.0, 1.0, 0.0, 1.0)):
 
 # Then modify the draw_cb function to properly place the handles at each corner
 
+def draw_grid(ctx):
+    """Draw grid lines in the viewport"""
+    if not ctx.scene.grid_settings.show_grid or not ctx.scene.grid_settings.enabled:
+        return
+
+    grid_size = ctx.scene.grid_settings.size
+    grid_color = ctx.scene.grid_settings.color
+
+    # Get viewport dimensions
+    region = ctx.region
+    width, height = region.width, region.height
+
+    # Calculate grid lines
+    h_lines = [(0, y, width, y) for y in range(0, height, int(grid_size))]
+    v_lines = [(x, 0, x, height) for x in range(0, width, int(grid_size))]
+
+    # Draw grid
+    shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+
+    # Horizontal lines
+    coords = []
+    for y in range(0, height, int(grid_size)):
+        coords.extend([(0, y), (width, y)])
+
+    # Vertical lines
+    for x in range(0, width, int(grid_size)):
+        coords.extend([(x, 0), (x, height)])
+
+    batch = batch_for_shader(shader, 'LINES', {"pos": coords})
+
+    gpu.state.blend_set('ALPHA')
+    gpu.state.line_width_set(1.0)
+    shader.bind()
+    shader.uniform_float("color", grid_color)
+    batch.draw(shader)
+    gpu.state.blend_set('NONE')
+
+
 def draw_cb():
     ctx = bpy.context
     scn, imgs = ctx.scene, ctx.scene.draggable_images
+
+    # Draw grid first (so it appears behind images)
+    draw_grid(ctx)
+
     if not imgs:
         return
 
@@ -607,35 +832,41 @@ def draw_cb():
         if not fp:
             continue
         if fp not in _tex_cache:
-            try:
-                img = bpy.data.images.load(fp, check_existing=True)
-            except Exception:
+            img, tex = safe_load_image(fp)
+            if not tex:
                 continue
-            _tex_cache[fp] = (img, gpu.texture.from_image(img))
-        tex = _tex_cache[fp][1]
+            _tex_cache[fp] = (img, tex)
+        elif _tex_cache[fp][1] is None:
+            continue
 
-        x, y, w, h = it.x, it.y, it.width, it.height
-        coords = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
-        u0, u1 = (1, 0) if it.flip_x else (0, 1)
-        v0, v1 = (1, 0) if it.flip_y else (0, 1)
-        uvs = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+        try:
+            tex = _tex_cache[fp][1]
 
-        batch = batch_for_shader(shader(), 'TRI_FAN', {"pos": coords, "texCoord": uvs})
-        shader().bind()
-        shader().uniform_float("color", (1, 1, 1, it.alpha))
-        shader().uniform_sampler("image", tex)
-        batch.draw(shader())
+            x, y, w, h = it.x, it.y, it.width, it.height
+            coords = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+            u0, u1 = (1, 0) if it.flip_x else (0, 1)
+            v0, v1 = (1, 0) if it.flip_y else (0, 1)
+            uvs = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
 
-        # Draw frame and handles when in drag mode
-        if VIEW3D_OT_drag_images._active:
-            # Draw green frame
-            draw_frame(x, y, w, h)
+            batch = batch_for_shader(shader(), 'TRI_FAN', {"pos": coords, "texCoord": uvs})
+            shader().bind()
+            shader().uniform_float("color", (1, 1, 1, it.alpha))
+            shader().uniform_sampler("image", tex)
+            batch.draw(shader())
 
-            # Draw corner handles at each corner
-            draw_corner_handle(x + w, y + h)  # Bottom-right
-            draw_corner_handle(x, y + h)  # Bottom-left
-            draw_corner_handle(x + w, y)  # Top-right
-            draw_corner_handle(x, y)  # Top-left
+            # Draw frame and handles when in drag mode
+            if VIEW3D_OT_drag_images._active:
+                # Draw green frame
+                draw_frame(x, y, w, h)
+
+                # Draw corner handles at each corner
+                draw_corner_handle(x + w, y + h)  # Bottom-right
+                draw_corner_handle(x, y + h)  # Bottom-left
+                draw_corner_handle(x + w, y)  # Top-right
+                draw_corner_handle(x, y)  # Top-left
+        except Exception as e:
+            print(f"Error drawing image {fp}: {e}")
+            continue
 
     gpu.state.blend_set('NONE')
 
@@ -646,6 +877,8 @@ def draw_cb():
         txt = "RMB / ESC exit • K resize • Drag green corners to resize"
         if not scn.bref_show_all_layers:
             txt += f" • Only layer {active_layer} visible"
+        if scn.grid_settings.enabled:
+            txt += f" • Grid snap: {int(scn.grid_settings.size)}px"
         w, _ = blf.dimensions(0, txt)
         blf.position(0, reg.width - w - 15, 20, 0)
         blf.draw(0, txt)
@@ -658,6 +891,7 @@ classes = (
     OrthoImageSettings,
     DraggableImage,
     OrthographicReferences,
+    GridSettings,
     IMAGE_UL_draggable,
 
     IMAGE_OT_add,
@@ -665,6 +899,7 @@ classes = (
     IMAGE_OT_move_layer,
     IMAGE_OT_reset_position,
     VIEW3D_OT_drag_images,
+    IMAGE_OT_smart_arrange,  # Add this line
 
     ORTHO_OT_spawn_references,
     ORTHO_OT_clear_references,
@@ -689,6 +924,7 @@ def register():
         default=True)
 
     bpy.types.Scene.ortho_refs = bpy.props.PointerProperty(type=OrthographicReferences)
+    bpy.types.Scene.grid_settings = bpy.props.PointerProperty(type=GridSettings)
 
     global _handle
     if _handle is None:
@@ -707,6 +943,7 @@ def unregister():
     del bpy.types.Scene.draggable_images
     del bpy.types.Scene.drag_img_index
     del bpy.types.Scene.bref_show_all_layers
+    del bpy.types.Scene.grid_settings
     del bpy.types.Scene.ortho_refs
 
     for c in reversed(classes):
