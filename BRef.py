@@ -3,7 +3,7 @@ bl_info = {
     "name":        "BRef",
     "author":      "Kaan Soyler",
     "maintainer":  "Kaan Soyler",
-    "version":     (1, 4, 0),
+    "version":     (1, 6, 0),
     "blender":     (4, 4, 0),
     "location":    "View 3D ▸ Sidebar ▸ BRef",
     "description": "Minimalistic Reference Addon in Blender! Add References in the viewport or directly in the 3‑D scene.",
@@ -126,6 +126,8 @@ class DraggableImage(bpy.types.PropertyGroup):
     size:     bpy.props.FloatProperty(name="Size",   default=200.0, min=10.0, update=_cb_size)
     width:    bpy.props.FloatProperty(default=200.0, min=10.0, update=_cb_dims)
     height:   bpy.props.FloatProperty(default=200.0, min=10.0, update=_cb_dims)
+    original_width: bpy.props.FloatProperty(default=0.0)
+    original_height: bpy.props.FloatProperty(default=0.0)
     maintain_aspect: bpy.props.BoolProperty(default=True)
     alpha:    bpy.props.FloatProperty(default=1.0, min=0.0, max=1.0, update=lambda s, c: redraw(c))
     layer:    bpy.props.IntProperty(default=0, update=lambda s, c: redraw(c))
@@ -147,7 +149,7 @@ class OrthographicReferences(bpy.types.PropertyGroup):
 
 # Add this after the other property groups
 class GridSettings(bpy.types.PropertyGroup):
-    enabled: bpy.props.BoolProperty(name="Enable Grid Snapping", default=False)
+    enabled: bpy.props.BoolProperty(name="Enable Grid Snapping", default=True)
     size: bpy.props.FloatProperty(name="Grid Size", default=20.0, min=1.0, description="Size of grid cells")
     color: bpy.props.FloatVectorProperty(
         name="Grid Color",
@@ -296,9 +298,6 @@ class IMAGE_OT_add(bpy.types.Operator):
         # Get all selected files
         filepaths = [os.path.join(self.directory, f.name) for f in self.files]
 
-        # Save current index to set to first newly added image
-        first_new_index = len(col)
-
         # Process each file
         for filepath in filepaths:
             if not os.path.isfile(filepath):
@@ -315,21 +314,24 @@ class IMAGE_OT_add(bpy.types.Operator):
 
                 # Create texture safely
                 _tex_cache[filepath] = (img, gpu.texture.from_image(img))
-                it.width, it.height = img.size[0] / 2, img.size[1] / 2  # ½-size
+                it.width, it.height = img.size[0] / 2, img.size[1] / 2
                 it.size = max(it.width, it.height)
+                it.original_width = it.width
+                it.original_height = it.height
+                # Set the index to the newly added image
+                ctx.scene.drag_img_index = len(col) - 1
                 added_count += 1
+
+                # Arrange only this new image without moving existing ones
+                if added_count > 0:
+                    try:
+                        bpy.ops.image.smart_arrange(arrange_all=False)
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Smart arrange failed: {str(e)}")
+
             except Exception as e:
                 self.report({'ERROR'}, f"Error loading {os.path.basename(filepath)}: {str(e)}")
                 continue
-
-        # If images were added, arrange them
-        if added_count > 0:
-            ctx.scene.drag_img_index = first_new_index
-            # Use try/except to prevent crashes if smart arrange fails
-            try:
-                bpy.ops.image.smart_arrange()
-            except Exception as e:
-                self.report({'WARNING'}, f"Smart arrange failed: {str(e)}")
 
         self.report({'INFO'}, f"Added {added_count} reference image(s)")
         redraw(ctx)
@@ -343,12 +345,12 @@ class IMAGE_OT_add(bpy.types.Operator):
 class IMAGE_OT_smart_arrange(bpy.types.Operator):
     bl_idname = "image.smart_arrange"
     bl_label = "Smart Arrange"
-    bl_description = "Arrange reference images from top-left corner downward"
+    bl_description = "Arrange reference images without overlapping"
 
     arrange_all: bpy.props.BoolProperty(
         name="Arrange All",
         description="Arrange all images or only newly added ones",
-        default=True
+        default=False
     )
 
     @classmethod
@@ -377,56 +379,114 @@ class IMAGE_OT_smart_arrange(bpy.types.Operator):
 
         viewport_width, viewport_height = region.width, region.height
 
-        MAX_SIZE = min(viewport_width, viewport_height) * 0.2
-        PADDING = 10  # Smaller padding between images
-        LEFT_MARGIN = 20  # Left margin
-        TOP_MARGIN = 20  # Top margin
+        MAX_SIZE = min(viewport_width, viewport_height) * 0.3
+        PADDING = 20
+        LEFT_MARGIN = 20
+        TOP_MARGIN = 40
+
+        # Get user's size reduction preference (0.0 = no reduction, higher values = more reduction)
+        size_reduction = ctx.scene.arrange_settings.size_reduction
 
         # Get images to arrange
-        images_to_arrange = list(col)
+        all_images = list(col)
 
-        # First pass: scale down all images
+        # If arrange_all is False, only arrange the newly added image
+        if not self.arrange_all and len(all_images) > 0:
+            current_idx = ctx.scene.drag_img_index
+            if 0 <= current_idx < len(all_images):
+                images_to_arrange = [all_images[current_idx]]
+            else:
+                images_to_arrange = [all_images[-1]]
+        else:
+            images_to_arrange = all_images
+
+        # Create a list of rectangle bounds for existing images that we're not arranging
+        existing_rects = []
+        for i, img in enumerate(all_images):
+            if img not in images_to_arrange:
+                existing_rects.append((img.x, img.y, img.x + img.width, img.y + img.height))
+
+        # First pass: apply user's size reduction if requested
         for img in images_to_arrange:
-            scale_factor = 1.0
+            if size_reduction > 0:
+                reduction_factor = 1.0 - size_reduction
+                orig_w, orig_h = img.original_width, img.original_height
 
-            # Always scale down images to fit better
-            w_scale = MAX_SIZE / img.width if img.width > MAX_SIZE / 2 else 1.0
-            h_scale = MAX_SIZE / img.height if img.height > MAX_SIZE / 2 else 1.0
-            scale_factor = min(w_scale, h_scale, 0.7)  # Force additional scaling
+                # Only scale down if the original is too big
+                if orig_w > MAX_SIZE or orig_h > MAX_SIZE:
+                    w_scale = MAX_SIZE / orig_w if orig_w > MAX_SIZE else 1.0
+                    h_scale = MAX_SIZE / orig_h if orig_h > MAX_SIZE else 1.0
+                    base_scale = min(w_scale, h_scale)
+                else:
+                    base_scale = 1.0
 
-            # Apply scaling
-            img.width *= scale_factor
-            img.height *= scale_factor
-            img.size = max(img.width, img.height)
+                final_scale = base_scale * reduction_factor
 
-        # Arrange images in a vertical column layout
-        current_x = LEFT_MARGIN
-        current_y = viewport_height - TOP_MARGIN
-        row_height = 0
-        max_row_width = viewport_width * 0.8  # Use 80% of viewport width
+                # Apply scaling from the original dims every time
+                img.width  = orig_w * final_scale
+                img.height = orig_h * final_scale
+                img.size   = max(img.width, img.height)
 
+        # Check if a position overlaps with any existing rectangle
+        def is_overlapping(x, y, w, h):
+            new_rect = (x, y, x + w, y + h)
+            for rect in existing_rects:
+                # Check if rectangles overlap
+                if not (new_rect[2] <= rect[0] or new_rect[0] >= rect[2] or
+                        new_rect[3] <= rect[1] or new_rect[1] >= rect[3]):
+                    return True
+            return False
+
+        # Functions to find available space for images
+        def find_grid_position(img_width, img_height):
+            # Start from top left
+            current_x = LEFT_MARGIN
+            current_y = viewport_height - TOP_MARGIN - img_height
+
+            # Try positions in grid-like fashion until we find one without overlap
+            while current_y > 0:
+                if current_x + img_width > viewport_width - PADDING:
+                    # Move to next row
+                    current_x = LEFT_MARGIN
+                    current_y -= (img_height + PADDING)
+                    continue
+
+                # Check if this position would cause overlap
+                if not is_overlapping(current_x, current_y, img_width, img_height):
+                    return current_x, current_y
+
+                # Move right
+                current_x += img_width + PADDING
+
+            # If no good position found, place at top left
+            return LEFT_MARGIN, viewport_height - TOP_MARGIN - img_height
+
+        # For each image we're arranging, find a position without overlap
         for img in images_to_arrange:
-            # Check if we need to start a new row
-            if current_x + img.width > max_row_width:
-                current_x = LEFT_MARGIN
-                current_y -= (row_height + PADDING)
-                row_height = 0
-
-            # Position image
-            img.x = current_x
-            img.y = current_y - img.height
+            # Find position for this image
+            img.x, img.y = find_grid_position(img.width, img.height)
 
             # Ensure image stays within viewport
             img.x = max(LEFT_MARGIN, min(img.x, viewport_width - img.width - PADDING))
             img.y = max(PADDING, min(img.y, viewport_height - img.height - PADDING))
 
-            # Update row height and move next position
-            row_height = max(row_height, img.height)
-            current_x += img.width + PADDING
+            # Add this image to existing rectangles so subsequent images won't overlap it
+            existing_rects.append((img.x, img.y, img.x + img.width, img.y + img.height))
 
-        self.report({'INFO'}, f"Arranged {len(images_to_arrange)} images from top-left")
+        count_str = "all" if self.arrange_all else "selected"
+        self.report({'INFO'}, f"Arranged {count_str} images without overlapping")
         redraw(ctx)
         return {'FINISHED'}
+
+class ArrangeSettings(bpy.types.PropertyGroup):
+    size_reduction: bpy.props.FloatProperty(
+        name="Size Reduction",
+        description="Amount to reduce image size during arrangement (0 = no reduction, 1 = maximum reduction)",
+        default=0.5,
+        min=0.0,
+        max=0.9,
+        step=0.05
+    )
 
 class IMAGE_OT_remove(bpy.types.Operator):
     bl_idname, bl_label = "image.remove_draggable", "Remove Image"
@@ -678,7 +738,16 @@ class VIEW3D_PT_bref_panel(bpy.types.Panel):
         # SMART ARRANGE
         arrange_box = lay.box()
         arrange_box.label(text="Image Layout", icon='ALIGN_MIDDLE')
-        arrange_box.operator("image.smart_arrange", text="Smart Arrange", icon='ALIGN_JUSTIFY')
+
+        # Add size reduction slider
+        arrange_box.prop(scn.arrange_settings, "size_reduction", slider=True, text="Size Reduction")
+
+        arrange_row = arrange_box.row(align=True)
+        arrange_op = arrange_row.operator("image.smart_arrange", text="Arrange Selected", icon='RESTRICT_SELECT_OFF')
+        arrange_op.arrange_all = False
+
+        arrange_op = arrange_row.operator("image.smart_arrange", text="Arrange All", icon='ALIGN_JUSTIFY')
+        arrange_op.arrange_all = True
 
 
         # ───── ORTHOGRAPHIC  ─────
@@ -892,6 +961,7 @@ classes = (
     DraggableImage,
     OrthographicReferences,
     GridSettings,
+    ArrangeSettings,
     IMAGE_UL_draggable,
 
     IMAGE_OT_add,
@@ -899,7 +969,7 @@ classes = (
     IMAGE_OT_move_layer,
     IMAGE_OT_reset_position,
     VIEW3D_OT_drag_images,
-    IMAGE_OT_smart_arrange,  # Add this line
+    IMAGE_OT_smart_arrange,
 
     ORTHO_OT_spawn_references,
     ORTHO_OT_clear_references,
@@ -917,6 +987,7 @@ def register():
             pass
 
     bpy.types.Scene.draggable_images = bpy.props.CollectionProperty(type=DraggableImage)
+    bpy.types.Scene.arrange_settings = bpy.props.PointerProperty(type=ArrangeSettings)
     bpy.types.Scene.drag_img_index   = bpy.props.IntProperty()
     bpy.types.Scene.bref_show_all_layers = bpy.props.BoolProperty(
         name="Show All Layers",
@@ -942,6 +1013,7 @@ def unregister():
 
     del bpy.types.Scene.draggable_images
     del bpy.types.Scene.drag_img_index
+    del bpy.types.Scene.arrange_settings
     del bpy.types.Scene.bref_show_all_layers
     del bpy.types.Scene.grid_settings
     del bpy.types.Scene.ortho_refs
