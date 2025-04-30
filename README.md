@@ -7,28 +7,40 @@ Simple, fast, and built for Blender 4.4+.
 
 ## Features
 
-**Viewport Overlay Images**
-- Add any image into the 3D Viewport, floating on top of everything else.
-- Drag images freely with mouse in "Drag Mode."
-- Resize easily while dragging (hold `K` key to resize).
-- Lock aspect ratio if needed.
-- Organize images by layers. Choose to view only the active layer or all layers.
-- Adjust each image's opacity.
-- Flip images horizontally or vertically.
-- Quickly center images with one click.
-- Manage images through a clean list inside the Sidebar.
+### 🖼️ Viewport Overlay Reference Images
+- Add image references as draggable overlays directly in the 3D viewport.
+- Support for multiple images with independent:
+  - Size
+  - Position (X, Y)
+  - Opacity (Alpha)
+  - Flip (X/Y)
+  - Maintain aspect ratio
+- Drag and resize interactively in **"Drag Mode"** (K key to resize or corner handles).
+- Layer system to organize references.
+- Show all layers toggle.
+- Smart Arrange tool to auto-layout images cleanly.
+- Center selected image to viewport.
+- Grid snapping (with customizable grid size and color).
 
-**Orthographic Scene References**
-- Load images into the 3D scene using Blender Empties.
-- Automatically place references for Front, Back, Left, Right, Top, and Bottom views.
-- Adjust size, distance from origin, and transparency per view.
-- Update or clear all ortho references with one button.
-- No manual positioning needed — BRef handles rotation and placement automatically.
+---
 
-**UI**
-- Fully integrated into the Sidebar under the "BRef" tab.
-- Minimal and clean panels, easy to understand at a glance.
-- "Drag Mode" toggle with helpful instructions at the bottom.
+### 🧭 Orthographic Reference Images
+- Enable reference images in 6 orthographic directions:
+  - Front / Back / Left / Right / Up / Down
+- Each with individual:
+  - File path
+  - Size
+  - Opacity
+- Automatically placed as `Empty` objects in 3D view.
+- Spawn or clear all orthographic references with one click.
+
+---
+
+### 🧰 UI Integration & Custom Panel
+- Custom **"BRef"** tab in the 3D View Sidebar.
+- Organized sections for overlay and orthographic images.
+- Interactive list UI for managing references.
+- Fully integrated with Blender's property and operator system.
 
 ---
 
